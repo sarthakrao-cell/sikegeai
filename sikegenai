@@ -1,0 +1,391 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Send, Image, Search, CornerDownLeft, Zap, Loader2 } from 'lucide-react';
+
+// --- Configuration and API Keys ---
+// These are intentionally empty or placeholder strings. The runtime environment provides them.
+const apiKey = ""; 
+const TEXT_MODEL = "gemini-2.5-flash-preview-09-2025";
+const IMAGE_MODEL = "imagen-4.0-generate-001";
+
+// --- Utility Functions ---
+
+/**
+ * Executes a fetch request with exponential backoff for resilience.
+ * @param {string} url - API endpoint URL.
+ * @param {object} options - Fetch request options (method, headers, body).
+ * @param {number} maxRetries - Maximum number of retries.
+ * @returns {Promise<Response>}
+ */
+const fetchWithBackoff = async (url, options, maxRetries = 5) => {
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            const response = await fetch(url, options);
+            if (!response.ok) {
+                // If response is not 429 (Too Many Requests), throw error immediately
+                if (response.status !== 429 && response.status !== 500) {
+                     // Check if there is an explicit error message in the response body
+                    const errorBody = await response.json().catch(() => ({}));
+                    const errorMessage = errorBody.error?.message || `HTTP error! Status: ${response.status}`;
+                    throw new Error(errorMessage);
+                }
+                // If it's a transient error (429/500), proceed to retry
+                throw new Error("Transient error, retrying...");
+            }
+            return response;
+        } catch (error) {
+            if (i === maxRetries - 1 || !error.message.includes("Transient error")) {
+                console.error("API Call Failed:", error);
+                throw new Error(`Failed to connect to the model after ${maxRetries} attempts: ${error.message}`);
+            }
+            const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+            console.log(`Retrying in ${Math.round(delay / 1000)}s...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+    throw new Error("Exceeded max retries.");
+};
+
+
+/**
+ * @typedef {Object} ChatMessage
+ * @property {'user' | 'ai'} role
+ * @property {'text' | 'image'} type
+ * @property {string} content - The text or the image URL (base64 data URL).
+ * @property {Array<{uri: string, title: string}>} [sources] - Optional citation sources for text.
+ */
+
+const App = () => {
+    const [chatHistory, setChatHistory] = useState([
+        { 
+            role: 'ai', 
+            type: 'text', 
+            content: "Hello! I am your multi-modal AI assistant, Sike GenAI. You can ask me anything or command me to generate an image (e.g., 'Generate an image of a cybernetic cat')."
+        }
+    ]);
+    const [input, setInput] = useState('');
+    const [isLoading, setIsLoading] = useState(false);
+    const chatEndRef = useRef(null);
+
+    // Scroll to the bottom of the chat window when history updates
+    useEffect(() => {
+        chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }, [chatHistory]);
+
+    /**
+     * Checks if the user's prompt is explicitly asking for image generation.
+     * @param {string} prompt 
+     * @returns {boolean}
+     */
+    const isImageGenerationRequest = (prompt) => {
+        const lowerPrompt = prompt.toLowerCase().trim();
+        return (
+            lowerPrompt.startsWith('generate ') ||
+            lowerPrompt.startsWith('create image of') ||
+            lowerPrompt.startsWith('draw ') ||
+            lowerPrompt.includes('generate an image of')
+        );
+    };
+
+    /**
+     * Handles the user's message submission, determining if it's a text or image request.
+     */
+    const handleSendMessage = async (e) => {
+        e.preventDefault();
+        const prompt = input.trim();
+        if (!prompt || isLoading) return;
+
+        // 1. Add user message to history
+        setChatHistory(prev => [...prev, { role: 'user', type: 'text', content: prompt }]);
+        setInput('');
+        setIsLoading(true);
+
+        try {
+            if (isImageGenerationRequest(prompt)) {
+                await generateImage(prompt);
+            } else {
+                await generateText(prompt);
+            }
+        } catch (error) {
+            console.error("Main Handler Error:", error);
+            setChatHistory(prev => [...prev, { 
+                role: 'ai', 
+                type: 'text', 
+                content: `An error occurred: ${error.message}. Please try again.` 
+            }]);
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    /**
+     * Calls the Imagen API to generate an image.
+     * @param {string} prompt 
+     */
+    const generateImage = async (prompt) => {
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${IMAGE_MODEL}:predict?key=${apiKey}`;
+        
+        // Imagen API payload
+        const payload = {
+            instances: [{ prompt: prompt }],
+            parameters: { "sampleCount": 1 }
+        };
+
+        try {
+            const response = await fetchWithBackoff(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            
+            const base64Data = result?.predictions?.[0]?.bytesBase64Encoded;
+
+            if (base64Data) {
+                const imageUrl = `data:image/png;base64,${base64Data}`;
+                setChatHistory(prev => [...prev, { 
+                    role: 'ai', 
+                    type: 'image', 
+                    content: imageUrl 
+                }]);
+            } else {
+                throw new Error("Image model returned no data.");
+            }
+        } catch (error) {
+            console.error("Image Generation Error:", error);
+            setChatHistory(prev => [...prev, { 
+                role: 'ai', 
+                type: 'text', 
+                content: `(Image Generation Failed) The model encountered an issue: ${error.message}` 
+            }]);
+        }
+    };
+
+    /**
+     * Calls the Gemini API for text generation with Google Search grounding.
+     * @param {string} prompt 
+     */
+    const generateText = async (prompt) => {
+        const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${TEXT_MODEL}:generateContent?key=${apiKey}`;
+        
+        // Gemini API payload for text with grounding
+        const payload = {
+            contents: [{ parts: [{ text: prompt }] }],
+            tools: [{ "google_search": {} }], // Enable grounding for current info
+            systemInstruction: {
+                parts: [{ text: "You are a concise, helpful, and creative AI assistant that uses Google Search to ground responses with up-to-date information when necessary. Maintain a friendly and professional tone." }]
+            },
+        };
+
+        try {
+            const response = await fetchWithBackoff(apiUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            const result = await response.json();
+            const candidate = result.candidates?.[0];
+
+            let text = "I am having trouble processing that request.";
+            let sources = [];
+
+            if (candidate && candidate.content?.parts?.[0]?.text) {
+                text = candidate.content.parts[0].text;
+                
+                // Extract grounding sources
+                const groundingMetadata = candidate.groundingMetadata;
+                if (groundingMetadata && groundingMetadata.groundingAttributions) {
+                    sources = groundingMetadata.groundingAttributions
+                        .map(attribution => ({
+                            uri: attribution.web?.uri,
+                            title: attribution.web?.title,
+                        }))
+                        .filter(source => source.uri && source.title);
+                }
+            }
+            
+            setChatHistory(prev => [...prev, { 
+                role: 'ai', 
+                type: 'text', 
+                content: text, 
+                sources: sources 
+            }]);
+
+        } catch (error) {
+            console.error("Text Generation Error:", error);
+            setChatHistory(prev => [...prev, { 
+                role: 'ai', 
+                type: 'text', 
+                content: `(Text Generation Failed) The model encountered an issue: ${error.message}` 
+            }]);
+        }
+    };
+
+    /**
+     * Renders a single chat message.
+     * @param {ChatMessage} message 
+     * @param {number} index 
+     * @returns {JSX.Element}
+     */
+    const ChatMessage = ({ message, index }) => {
+        const isUser = message.role === 'user';
+        // Renamed 'Nightfall AI' to 'Sike GenAI'
+        const roleName = isUser ? 'You' : 'Sike GenAI';
+        const alignmentClass = isUser ? 'justify-end' : 'justify-start';
+        const bubbleClasses = isUser 
+            ? 'bg-indigo-600 text-white rounded-br-none' 
+            : 'bg-gray-700 text-gray-100 rounded-tl-none';
+
+        return (
+            <div key={index} className={`flex ${alignmentClass} mb-4`}>
+                <div className={`max-w-3xl px-4 py-3 rounded-xl shadow-lg ${bubbleClasses}`}>
+                    <div className="font-semibold text-xs mb-1 opacity-70">
+                        {roleName}
+                    </div>
+
+                    {message.type === 'text' && (
+                        <div>
+                            <p className="whitespace-pre-wrap">{message.content}</p>
+                            
+                            {/* Render Sources if available */}
+                            {message.sources && message.sources.length > 0 && (
+                                <div className="mt-2 pt-2 border-t border-gray-600 text-xs opacity-80">
+                                    <p className="font-medium mb-1 flex items-center">
+                                        <Search size={12} className="mr-1" />
+                                        Sources:
+                                    </p>
+                                    <ul className="list-disc ml-4 space-y-0.5">
+                                        {message.sources.map((source, idx) => (
+                                            <li key={idx}>
+                                                <a 
+                                                    href={source.uri} 
+                                                    target="_blank" 
+                                                    rel="noopener noreferrer" 
+                                                    className="text-indigo-400 hover:text-indigo-300 transition-colors truncate block"
+                                                    title={source.title}
+                                                >
+                                                    {source.title || 'Link'}
+                                                </a>
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {message.type === 'image' && (
+                        <div className="flex flex-col items-center space-y-2">
+                            <Image size={20} className="text-white mb-2" />
+                            <p className="text-sm">Image Generation Result:</p>
+                            <img 
+                                src={message.content} 
+                                alt="Generated by AI" 
+                                className="w-full max-w-sm h-auto rounded-lg shadow-2xl transition-transform hover:scale-[1.02]"
+                            />
+                            <p className="text-xs opacity-70 mt-1">Image created by Imagen 4.0</p>
+                        </div>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    return (
+        <div className="flex flex-col h-screen bg-gray-950 text-gray-100 font-sans p-4 sm:p-6 lg:p-8">
+            {/* Header */}
+            <header className="flex items-center justify-center p-3 mb-4 bg-gray-900 rounded-xl shadow-lg">
+                <Zap size={24} className="text-indigo-400 mr-2" />
+                {/* Renamed to Sike GenAI */}
+                <h1 className="text-xl font-bold tracking-wider">
+                    Sike <span className="text-indigo-400">GenAI</span>
+                </h1>
+            </header>
+
+            {/* Main Chat Area */}
+            <div className="flex-grow overflow-hidden bg-gray-900 rounded-xl shadow-2xl flex flex-col">
+                <div id="chat-window" className="flex-grow overflow-y-auto p-4 space-y-4 custom-scrollbar">
+                    {chatHistory.map((msg, index) => (
+                        <ChatMessage key={index} message={msg} index={index} />
+                    ))}
+                    <div ref={chatEndRef} />
+                </div>
+
+                {/* Loading Indicator */}
+                {isLoading && (
+                    <div className="flex justify-center p-3 bg-gray-800 border-t border-gray-700">
+                        <Loader2 className="animate-spin text-indigo-400 mr-2" size={20} />
+                        <span className="text-sm text-gray-400">
+                            {isImageGenerationRequest(chatHistory[chatHistory.length - 1].content) ? 'Generating Image...' : 'AI is typing...'}
+                        </span>
+                    </div>
+                )}
+                
+                {/* Input Form */}
+                <form onSubmit={handleSendMessage} className="p-4 bg-gray-800 border-t border-gray-700">
+                    <div className="relative flex items-center">
+                        <input
+                            type="text"
+                            value={input}
+                            onChange={(e) => setInput(e.target.value)}
+                            onKeyDown={(e) => {
+                                if (e.key === 'Enter' && !e.shiftKey) {
+                                    handleSendMessage(e);
+                                }
+                            }}
+                            placeholder="Type your command or question..."
+                            disabled={isLoading}
+                            className="w-full p-4 pl-4 pr-16 bg-gray-700 text-gray-100 rounded-xl border border-gray-600 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-colors shadow-inner placeholder:text-gray-400 disabled:opacity-70 disabled:cursor-not-allowed"
+                            style={{ minHeight: '56px' }}
+                        />
+                        <button
+                            type="submit"
+                            disabled={!input.trim() || isLoading}
+                            className="absolute right-2 p-3 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:bg-gray-600 disabled:cursor-not-allowed transition-colors shadow-md"
+                            aria-label="Send message"
+                        >
+                            <Send size={20} />
+                        </button>
+                    </div>
+                    <p className="mt-1 text-xs text-gray-500 flex items-center">
+                        <CornerDownLeft size={10} className="mr-1" /> 
+                        Press Enter to send.
+                    </p>
+                </form>
+            </div>
+
+            {/* Tailwind CSS Script for Dark Theme */}
+            <script src="https://cdn.tailwindcss.com"></script>
+            <style>
+                {`
+                    /* Dark mode scrollbar for aesthetics */
+                    .custom-scrollbar::-webkit-scrollbar {
+                        width: 8px;
+                    }
+
+                    .custom-scrollbar::-webkit-scrollbar-track {
+                        background: #1f2937; /* gray-800 */
+                    }
+
+                    .custom-scrollbar::-webkit-scrollbar-thumb {
+                        background: #4b5563; /* gray-600 */
+                        border-radius: 4px;
+                    }
+
+                    .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+                        background: #6b7280; /* gray-500 */
+                    }
+
+                    html, body, #root {
+                        height: 100%;
+                        margin: 0;
+                        overflow: hidden;
+                    }
+                `}
+            </style>
+        </div>
+    );
+};
+
+export default App;
